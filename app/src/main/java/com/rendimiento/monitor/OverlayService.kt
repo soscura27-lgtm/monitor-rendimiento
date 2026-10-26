@@ -51,6 +51,8 @@ class OverlayService : Service() {
     private lateinit var tvApp: TextView
     private lateinit var tvFps: TextView
     private lateinit var tvLow: TextView
+    private lateinit var tvPing: TextView
+    private lateinit var tvTop: TextView
     private lateinit var tvCpu: TextView
     private lateinit var tvGpu: TextView
     private lateinit var tvRam: TextView
@@ -67,6 +69,10 @@ class OverlayService : Service() {
 
     @Volatile
     private var binding = false
+
+    /** Cuando empezo el enlace con Shizuku; si pasa de BIND_TIMEOUT_MS sin respuesta se reintenta. */
+    @Volatile
+    private var bindStartedAt = 0L
 
     private var last: Snapshot = Snapshot()
 
@@ -116,7 +122,8 @@ class OverlayService : Service() {
             .daemon(false)
             .processNameSuffix("shell")
             .debuggable(false)
-            .version(1)
+            // Version 2: la interfaz AIDL cambio (procTable y sockets). Subirla obliga a Shizuku a reiniciar el proceso.
+            .version(2)
         sampler = Sampler(this) { shell }
     }
 
@@ -152,6 +159,7 @@ class OverlayService : Service() {
         val w = Handler(t.looper)
         worker = w
         w.post(tick)
+        sampler.startBackground()
 
         running = true
         return START_NOT_STICKY
@@ -163,6 +171,7 @@ class OverlayService : Service() {
             prefs.unregisterOnSharedPreferenceChangeListener(prefListener)
         } catch (e: Throwable) {
         }
+        sampler.stopBackground()
         worker?.removeCallbacksAndMessages(null)
         thread?.quitSafely()
         thread = null
@@ -190,11 +199,16 @@ class OverlayService : Service() {
     // ---------------------------------------------------------------- Shizuku
 
     private fun ensureShell() {
+        // Si el enlace quedo colgado (Shizuku nunca respondio), se libera para reintentar.
+        if (binding && System.currentTimeMillis() - bindStartedAt > BIND_TIMEOUT_MS) {
+            binding = false
+        }
         if (shell != null || binding) return
         try {
             if (!Shizuku.pingBinder()) return
             if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) return
             binding = true
+            bindStartedAt = System.currentTimeMillis()
             Shizuku.bindUserService(userServiceArgs, connection)
         } catch (e: Throwable) {
             binding = false
@@ -266,6 +280,12 @@ class OverlayService : Service() {
         tvFps = newText()
         tvFps.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
         tvLow = newText()
+        tvPing = newText()
+        tvTop = newText()
+        tvTop.setTextColor(GREY)
+        tvTop.isSingleLine = true
+        tvTop.maxWidth = dp(260)
+        tvTop.ellipsize = TextUtils.TruncateAt.END
         tvCpu = newText()
         tvGpu = newText()
         tvRam = newText()
@@ -276,11 +296,13 @@ class OverlayService : Service() {
         box.addView(tvApp)
         box.addView(tvFps)
         box.addView(tvLow)
+        box.addView(tvPing)
         box.addView(tvCpu)
         box.addView(tvGpu)
         box.addView(tvRam)
         box.addView(tvBat)
         box.addView(tvThermal)
+        box.addView(tvTop)
         box.addView(
             graph,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(36))
@@ -340,7 +362,7 @@ class OverlayService : Service() {
 
     private fun applyStyle() {
         val size = prefs.getInt(Prefs.TEXT_SIZE, 12).toFloat()
-        val lines = listOf(tvLow, tvCpu, tvGpu, tvRam, tvBat, tvThermal)
+        val lines = listOf(tvLow, tvPing, tvCpu, tvGpu, tvRam, tvBat, tvThermal, tvTop)
         for (t in lines) t.setTextSize(TypedValue.COMPLEX_UNIT_SP, size)
         tvFps.setTextSize(TypedValue.COMPLEX_UNIT_SP, size + 4f)
         tvApp.setTextSize(TypedValue.COMPLEX_UNIT_SP, size - 2f)
@@ -356,6 +378,9 @@ class OverlayService : Service() {
 
     private fun fmt(v: Float, decimals: Int): String =
         String.format(Locale.US, if (decimals == 0) "%.0f" else "%.1f", v)
+
+    /** "com.ejemplo.juego" -> "juego": cabe mejor en la barra. */
+    private fun shortName(pkg: String): String = pkg.substringAfterLast('.')
 
     private fun colorForFps(fps: Float): Int = when {
         fps >= 50f -> GREEN
@@ -387,7 +412,8 @@ class OverlayService : Service() {
             tvFps.text = "FPS —  (necesita Shizuku)"
         } else if (s.fps.isNaN()) {
             tvFps.setTextColor(GREY)
-            tvFps.text = "FPS —"
+            // Antes solo salia "FPS —". Ahora se dice la causa (sin app detectada, sin capa, etc.).
+            tvFps.text = "FPS —" + (if (s.fpsStatus.isNotEmpty()) "  " + s.fpsStatus else "")
         } else {
             tvFps.setTextColor(colorForFps(s.fps))
             val ms = if (s.frameMs.isNaN()) "" else "  " + fmt(s.frameMs, 1) + " ms"
@@ -399,6 +425,35 @@ class OverlayService : Service() {
         if (!s.refreshHz.isNaN()) lowParts.add(fmt(s.refreshHz, 0) + " Hz")
         tvLow.text = lowParts.joinToString(" · ")
         tvLow.visibility = if (showFps && lowParts.isNotEmpty()) View.VISIBLE else View.GONE
+
+        // Ping: independiente de los FPS, funciona con cualquier juego que tenga conexion de red.
+        val showPing = prefs.getBoolean(Prefs.SHOW_PING, true)
+        tvPing.text = when {
+            !s.shellOk -> "Ping —  (necesita Shizuku)"
+            s.pingIp == null -> "Ping —  buscando servidor"
+            s.pingMs.isNaN() -> "Ping —  sin respuesta"
+            else -> "Ping " + fmt(s.pingMs, 0) + " ms · prom " + fmt(s.pingAvgMs, 0)
+        }
+        tvPing.setTextColor(
+            when {
+                s.pingMs.isNaN() -> GREY
+                s.pingMs < 60f -> GREEN
+                s.pingMs < 120f -> YELLOW
+                else -> RED
+            }
+        )
+        tvPing.visibility = if (showPing) View.VISIBLE else View.GONE
+
+        // Categoria de consumo: que app usa mas CPU y mas RAM (sin contar la propia barra).
+        val showApps = prefs.getBoolean(Prefs.SHOW_APPS, true)
+        val others = s.apps.filter { it.pkg != packageName }
+        val topCpu = others.firstOrNull { !it.cpuPct.isNaN() && it.cpuPct >= 1f }
+        val topRam = others.maxByOrNull { it.ramMb }
+        val topParts = ArrayList<String>()
+        if (topCpu != null) topParts.add("CPU " + shortName(topCpu.pkg) + " " + fmt(topCpu.cpuPct, 0) + "%")
+        if (topRam != null && topRam.ramMb > 0f) topParts.add("RAM " + shortName(topRam.pkg) + " " + fmt(topRam.ramMb, 0) + " MB")
+        tvTop.text = topParts.joinToString(" · ")
+        tvTop.visibility = if (showApps && topParts.isNotEmpty()) View.VISIBLE else View.GONE
 
         // Grafica
         if (!s.fps.isNaN() && s.shellOk) {
@@ -465,6 +520,7 @@ class OverlayService : Service() {
         private const val CHANNEL_ID = "monitor_rendimiento"
         private const val NOTIF_ID = 1001
         private const val SAMPLE_EVERY_MS = 1000L
+        private const val BIND_TIMEOUT_MS = 10000L
 
         private val GREEN = Color.parseColor("#66BB6A")
         private val YELLOW = Color.parseColor("#FFCA28")

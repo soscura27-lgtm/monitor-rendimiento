@@ -13,6 +13,8 @@ object Prefs {
     const val SHOW_BAT = "show_bat"
     const val SHOW_TEMP = "show_temp"
     const val SHOW_GRAPH = "show_graph"
+    const val SHOW_PING = "show_ping"
+    const val SHOW_APPS = "show_apps"
 
     const val TEXT_SIZE = "text_size"
     const val OPACITY = "opacity"

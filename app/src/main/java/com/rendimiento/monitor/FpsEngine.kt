@@ -18,7 +18,8 @@ class FpsEngine(
         val pkg: String?,
         val fps: Float,
         val frameMs: Float,
-        val low1: Float
+        val low1: Float,
+        val status: String = ""
     )
 
     private class LayerSample(
@@ -42,7 +43,7 @@ class FpsEngine(
     private var ringPos = 0
 
     fun poll(): Result {
-        val sh = shellProvider() ?: return empty(null)
+        val sh = shellProvider() ?: return empty(null, "Sin Shizuku: no hay FPS")
         val now = SystemClock.elapsedRealtime()
 
         if (now - fgCheckedAt >= FG_EVERY_MS) {
@@ -58,16 +59,16 @@ class FpsEngine(
             }
         }
 
-        val pkg = fgPkg ?: return empty(null)
-        if (pkg == ownPackage) return empty(pkg)
+        val pkg = fgPkg ?: return empty(null, "Buscando app al frente…")
+        if (pkg == ownPackage) return empty(pkg, "Abre un juego o app")
 
         if (layers.isEmpty() || now - layersAt >= LAYERS_EVERY_MS) {
             layersAt = now
             layers = findLayers(sh, pkg)
         }
-        if (layers.isEmpty()) return empty(pkg)
+        if (layers.isEmpty()) return empty(pkg, "Sin capa de video para esta app")
 
-        val picked = pick(sh, now) ?: return empty(pkg)
+        val picked = pick(sh, now) ?: return empty(pkg, "Esperando fotogramas…")
         val name = picked.first
         val sample = picked.second
 
@@ -92,10 +93,12 @@ class FpsEngine(
         val fps = if (stale) 0f else sample.fps
         val frameMs = if (fps > 0f) 1000f / fps else Float.NaN
         val low = if (stale) Float.NaN else lowFps()
-        return Result(pkg, fps, frameMs, low)
+        val status = if (stale) "Juego sin fotogramas nuevos" else ""
+        return Result(pkg, fps, frameMs, low, status)
     }
 
-    private fun empty(pkg: String?): Result = Result(pkg, Float.NaN, Float.NaN, Float.NaN)
+    private fun empty(pkg: String?, why: String): Result =
+        Result(pkg, Float.NaN, Float.NaN, Float.NaN, why)
 
     private fun resetStats() {
         ringCount = 0

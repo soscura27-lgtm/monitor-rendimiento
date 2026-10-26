@@ -278,11 +278,16 @@ class MainActivity : Activity() {
         btnToggle = button("") { onToggleClick() }
         col.addView(btnToggle)
         col.addView(text("Arrastra la barra para moverla. Para cerrarla usa este botón o la notificación.", 12f, GREY, false))
+        col.addView(button("Ver consumo por app (CPU, RAM, red)") {
+            startActivity(Intent(this, ConsumoActivity::class.java))
+        })
         col.addView(space(12))
 
         col.addView(text("Qué mostrar", 16f, Color.WHITE, true))
         col.addView(check("FPS y tiempo por fotograma", Prefs.SHOW_FPS, true))
         col.addView(check("Gráfica de FPS", Prefs.SHOW_GRAPH, true))
+        col.addView(check("Ping al servidor del juego", Prefs.SHOW_PING, true))
+        col.addView(check("App que más CPU y RAM consume", Prefs.SHOW_APPS, true))
         col.addView(check("CPU", Prefs.SHOW_CPU, true))
         col.addView(check("GPU", Prefs.SHOW_GPU, true))
         col.addView(check("RAM", Prefs.SHOW_RAM, true))

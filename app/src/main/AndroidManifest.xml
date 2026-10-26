@@ -27,6 +27,11 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".ConsumoActivity"
+            android:exported="false"
+            android:label="Consumo por app" />
+
         <service
             android:name=".OverlayService"
             android:exported="false"

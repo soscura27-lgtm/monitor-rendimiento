@@ -58,8 +58,103 @@ class ShellService() : IShellService.Stub() {
         }
     }
 
+    override fun procTable(): String {
+        val sb = StringBuilder()
+        val dirs = File("/proc").listFiles() ?: return ""
+        for (d in dirs) {
+            val pid = d.name.toIntOrNull() ?: continue
+            try {
+                val stat = File(d, "stat").readText()
+                // El nombre del proceso va entre parentesis y puede tener espacios: se salta hasta el ultimo ')'.
+                val after = stat.substring(stat.lastIndexOf(')') + 2).trim().split(' ')
+                // Campos tras el nombre: [0]=estado ... [11]=utime, [12]=stime (campos 14 y 15 de stat).
+                val utime = after.getOrNull(11)?.toLongOrNull() ?: 0L
+                val stime = after.getOrNull(12)?.toLongOrNull() ?: 0L
+
+                var uid = -1
+                var rssKb = 0L
+                for (line in File(d, "status").readLines()) {
+                    if (line.startsWith("Uid:")) {
+                        uid = line.substring(4).trim().split(WS).firstOrNull()?.toIntOrNull() ?: -1
+                    } else if (line.startsWith("VmRSS:")) {
+                        rssKb = line.substring(6).trim().split(WS).firstOrNull()?.toLongOrNull() ?: 0L
+                    }
+                }
+                if (uid < 0) continue
+
+                val cmd = try {
+                    File(d, "cmdline").readBytes().toString(Charsets.UTF_8).substringBefore('\u0000')
+                } catch (e: Throwable) {
+                    ""
+                }
+
+                var rx = -1L
+                var tx = -1L
+                if (uid >= APP_UID_MIN) {
+                    rx = readLongOrNeg("/proc/uid_stat/$uid/tcp_rcv")
+                    tx = readLongOrNeg("/proc/uid_stat/$uid/tcp_snd")
+                }
+
+                sb.append(pid).append('|').append(uid).append('|')
+                    .append(utime).append('|').append(stime).append('|')
+                    .append(rssKb).append('|').append(rx).append('|').append(tx).append('|')
+                    .append(cmd.replace('|', '_').replace('\n', ' ')).append('\n')
+            } catch (e: Throwable) {
+                // El proceso pudo terminar mientras se leia: se ignora.
+            }
+            if (sb.length >= MAX_OUT) break
+        }
+        return sb.toString()
+    }
+
+    override fun sockets(): String {
+        val sb = StringBuilder()
+        for ((file, proto) in listOf(
+            "/proc/net/tcp" to "tcp", "/proc/net/udp" to "udp"
+        )) {
+            appendSockets(sb, file, proto)
+        }
+        return sb.toString()
+    }
+
+    private fun appendSockets(sb: StringBuilder, path: String, proto: String) {
+        val lines = try {
+            File(path).readLines()
+        } catch (e: Throwable) {
+            return
+        }
+        for (line in lines.drop(1)) {
+            val f = line.trim().split(WS)
+            if (f.size < 8) continue
+            val remote = f[2]
+            val state = f[3]
+            val uid = f[7].toIntOrNull() ?: continue
+            if (uid < APP_UID_MIN) continue
+            val parts = remote.split(':')
+            if (parts.size != 2) continue
+            val ipHex = parts[0]
+            val port = parts[1].toIntOrNull(16) ?: continue
+            if (ipHex.length != 8) continue
+            // /proc/net/tcp guarda la IPv4 en orden little-endian.
+            val b = (0 until 4).map { ipHex.substring(it * 2, it * 2 + 2).toInt(16) }
+            val ip = "${b[3]}.${b[2]}.${b[1]}.${b[0]}"
+            if (ip == "0.0.0.0" || port == 0) continue
+            sb.append(uid).append('|').append(proto).append('|').append(state).append('|')
+                .append(ip).append('|').append(port).append('\n')
+        }
+    }
+
+    private fun readLongOrNeg(path: String): Long =
+        try {
+            File(path).readText().trim().toLong()
+        } catch (e: Throwable) {
+            -1L
+        }
+
     companion object {
         private const val MAX_FILE = 20000
         private const val MAX_OUT = 200000
+        private const val APP_UID_MIN = 10000
+        private val WS = Regex("\\s+")
     }
 }

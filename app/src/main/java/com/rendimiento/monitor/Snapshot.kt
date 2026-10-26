@@ -24,5 +24,11 @@ data class Snapshot(
     val batMa: Int = Int.MIN_VALUE,
     val batW: Float = Float.NaN,
     val charging: Boolean = false,
-    val thermalStatus: Int = -1
+    val thermalStatus: Int = -1,
+    /** Por que no hay FPS (texto corto), o "" si se estan leyendo bien. */
+    val fpsStatus: String = "",
+    val pingMs: Float = Float.NaN,
+    val pingAvgMs: Float = Float.NaN,
+    val pingIp: String? = null,
+    val apps: List<AppMonitor.AppStat> = emptyList()
 )

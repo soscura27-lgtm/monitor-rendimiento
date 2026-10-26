@@ -28,9 +28,25 @@ class Sampler(
     private val displayManager = ctx.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
 
     private val fpsEngine = FpsEngine(ctx.packageName, shellProvider)
+    private val appMonitor = AppMonitor(shellProvider)
+
+    @Volatile
+    private var fgUid: Int? = null
+    private val pingEngine = PingEngine(shellProvider) { fgUid }
 
     private var prevIdle = -1L
     private var prevTotal = -1L
+
+    /** Arranca el hilo de ping. Llamar una vez al iniciar la barra. */
+    fun startBackground() {
+        pingEngine.start()
+    }
+
+    /** Detiene el hilo de ping al cerrar la barra. */
+    fun stopBackground() {
+        pingEngine.stop()
+        fgUid = null
+    }
 
     private var zonesViaShell: Boolean? = null
     private var cpuZones: List<String> = emptyList()
@@ -59,6 +75,7 @@ class Sampler(
 
         // CPU: uso total a partir de /proc/stat (solo legible con shell).
         var cpuPct = Float.NaN
+        var totalDelta = -1L
         val statLine = r[0].lineSequence().firstOrNull { it.startsWith("cpu ") }
         if (statLine != null) {
             val v = statLine.trim().split(WS).drop(1).mapNotNull { it.toLongOrNull() }
@@ -68,6 +85,7 @@ class Sampler(
                 for (k in 0 until minOf(v.size, 8)) total += v[k]
                 if (prevTotal >= 0L && total > prevTotal) {
                     val dTotal = total - prevTotal
+                    totalDelta = dTotal
                     val dIdle = idle - prevIdle
                     cpuPct = ((dTotal - dIdle).toFloat() / dTotal.toFloat() * 100f).coerceIn(0f, 100f)
                 }
@@ -156,7 +174,17 @@ class Sampler(
 
         val f = fpsEngine.poll()
 
+        // Ping y consumo por app: el UID del juego al frente sale del mapa de paquetes.
+        fgUid = f.pkg?.let { appMonitor.uidOf(it) }
+        appMonitor.update(totalDelta, System.currentTimeMillis())
+        val ping = pingEngine.current()
+
         return Snapshot(
+            fpsStatus = f.status,
+            pingMs = ping.lastMs,
+            pingAvgMs = ping.avgMs,
+            pingIp = ping.ip,
+            apps = appMonitor.current(),
             shellOk = shellOk,
             pkg = f.pkg,
             fps = f.fps,

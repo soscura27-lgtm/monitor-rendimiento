@@ -12,4 +12,10 @@ interface IShellService {
 
     // Ejecuta un comando (sin shell) con permisos de shell y devuelve su salida.
     String exec(in String[] args) = 3;
+
+    // Tabla de procesos: una linea por proceso con "pid|uid|utime|stime|rssKb|bytesRx|bytesTx|cmdline".
+    String procTable() = 4;
+
+    // Conexiones TCP/UDP de todos los UIDs: una linea por socket con "uid|proto|state|remoteIp|remotePort".
+    String sockets() = 5;
 }

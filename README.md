@@ -8,6 +8,8 @@ temperaturas, batería y una gráfica de FPS. Se dibuja encima de cualquier jueg
 | Dato | Necesita Shizuku |
 | --- | --- |
 | FPS, ms por fotograma, 1% low y gráfica de la app al frente | Sí |
+| Ping al servidor del juego (ms y promedio) | Sí |
+| App que más CPU y RAM consume (barra y pantalla "Consumo por app") | Sí |
 | Uso de CPU (%) | Sí |
 | Uso y frecuencia de GPU | Sí (solo chips Adreno; otros pueden salir con "—") |
 | Frecuencia de CPU y temperaturas de CPU/GPU | Casi siempre sí |
@@ -46,6 +48,9 @@ El APK queda en `app/build/outputs/apk/debug/app-debug.apk`.
 - `OverlayService.kt`: servicio en primer plano que dibuja la barra y refresca cada segundo.
 - `Sampler.kt`: reúne RAM, batería, CPU, GPU y temperaturas.
 - `FpsEngine.kt`: calcula FPS y 1% low a partir de SurfaceFlinger.
+- `PingEngine.kt`: ping ICMP al servidor del juego (IP sacada de los sockets de su UID).
+- `AppMonitor.kt`: CPU, RAM y red por paquete a partir de la tabla de procesos.
+- `ConsumoActivity.kt`: pantalla "Consumo por app" con las categorías CPU, RAM y red.
 - `ShellService.kt` + `IShellService.aidl`: proceso con permisos de shell que arranca Shizuku.
 - `GraphView.kt`: gráfica del historial de FPS.
 
@@ -55,4 +60,11 @@ El APK queda en `app/build/outputs/apk/debug/app-debug.apk`.
   teléfono, la barra muestra "—" en esa línea.
 - La detección de la app al frente usa `dumpsys`, así que puede tardar hasta 3 segundos en
   notar un cambio de app.
+- Si la barra muestra "FPS —" con un motivo, ese texto dice la causa: sin Shizuku, sin app
+  detectada, sin capa de video para esa app o esperando fotogramas.
+- El ping se mide al servidor al que el juego tiene sockets abiertos (IPv4, ping ICMP). Si el
+  servidor no responde a ping aparece "sin respuesta". Los juegos que solo usan IPv6 no tienen ping.
+- El consumo por app de RAM suma RSS, que incluye librerías compartidas: es una aproximación.
+  La GPU y la batería por app no se pueden leer sin root.
+- La red por app depende del kernel del teléfono; si no la expone, aparece "No disponible".
 - Esta versión no se ha probado en un dispositivo real.
