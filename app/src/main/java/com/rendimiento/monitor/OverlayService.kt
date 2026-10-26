@@ -8,107 +8,73 @@ import android.app.Service
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.content.ServiceConnection
 import android.content.SharedPreferences
-import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
-import android.graphics.Color
+import android.content.res.Configuration
 import android.graphics.PixelFormat
-import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
+import android.graphics.Point
 import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
-import android.text.TextUtils
-import android.util.TypedValue
+import android.service.quicksettings.TileService
+import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.WindowManager
-import android.widget.LinearLayout
-import android.widget.TextView
+import android.widget.FrameLayout
 import android.widget.Toast
-import rikka.shizuku.Shizuku
-import java.util.Locale
+import kotlin.math.abs
 
 /**
- * Servicio en primer plano que dibuja la barra flotante con las metricas
- * y las actualiza una vez por segundo.
+ * Servicio en primer plano que dibuja la barra flotante y la actualiza en tiempo real
+ * (cada 0,5, 1 o 2 s segun los ajustes).
+ *
+ * Toque corto: cambia entre barra compacta y panel estelar. Mantener presionado: abre la app.
+ * Arrastrar: mueve la barra (se guarda una posicion para vertical y otra para horizontal).
  */
 class OverlayService : Service() {
 
     private lateinit var windowManager: WindowManager
     private lateinit var prefs: SharedPreferences
     private lateinit var params: WindowManager.LayoutParams
-    private lateinit var userServiceArgs: Shizuku.UserServiceArgs
     private lateinit var sampler: Sampler
 
-    private var root: LinearLayout? = null
-    private lateinit var tvApp: TextView
-    private lateinit var tvFps: TextView
-    private lateinit var tvLow: TextView
-    private lateinit var tvPing: TextView
-    private lateinit var tvTop: TextView
-    private lateinit var tvCpu: TextView
-    private lateinit var tvGpu: TextView
-    private lateinit var tvRam: TextView
-    private lateinit var tvBat: TextView
-    private lateinit var tvThermal: TextView
-    private lateinit var graph: GraphView
+    private var root: FrameLayout? = null
+    private lateinit var compact: CompactHudView
+    private lateinit var panel: StellarPanelView
+    private val state = OverlayState()
+    private var cfg: HudConfig? = null
+    private var lastPkg: String? = null
+    private var shellAcquired = false
 
     private val ui = Handler(Looper.getMainLooper())
     private var thread: HandlerThread? = null
     private var worker: Handler? = null
 
-    @Volatile
-    private var shell: IShellService? = null
-
-    @Volatile
-    private var binding = false
-
-    /** Cuando empezo el enlace con Shizuku; si pasa de BIND_TIMEOUT_MS sin respuesta se reintenta. */
-    @Volatile
-    private var bindStartedAt = 0L
-
-    private var last: Snapshot = Snapshot()
-
-    private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
-        ui.post {
-            applyStyle()
-            render(last)
-        }
-    }
-
-    private val connection = object : ServiceConnection {
-        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-            binding = false
-            shell = if (service != null && service.pingBinder()) {
-                IShellService.Stub.asInterface(service)
-            } else {
-                null
-            }
-        }
-
-        override fun onServiceDisconnected(name: ComponentName?) {
-            shell = null
-            binding = false
-        }
+    private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        ui.post { onPrefsChanged(key) }
     }
 
     private val tick = object : Runnable {
         override fun run() {
+            val start = SystemClock.uptimeMillis()
             try {
-                ensureShell()
+                ShellClient.ensure()
                 val s = sampler.sample()
                 ui.post { render(s) }
             } catch (e: Throwable) {
                 // Una lectura fallida no debe detener la barra.
             }
-            worker?.postDelayed(this, SAMPLE_EVERY_MS)
+            val every = Prefs.refreshMs(prefs)
+            val delay = (every - (SystemClock.uptimeMillis() - start)).coerceAtLeast(120L)
+            worker?.postDelayed(this, delay)
         }
     }
 
@@ -118,19 +84,19 @@ class OverlayService : Service() {
         super.onCreate()
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         prefs = Prefs.of(this)
-        userServiceArgs = Shizuku.UserServiceArgs(ComponentName(packageName, ShellService::class.java.name))
-            .daemon(false)
-            .processNameSuffix("shell")
-            .debuggable(false)
-            // Version 3: la interfaz AIDL cambio (sockets con puerto local y conntrack). Subirla obliga a Shizuku a reiniciar el proceso.
-            .version(3)
-        sampler = Sampler(this) { shell }
+        sampler = Sampler(this, { ShellClient.shell }, { prefs.getBoolean(Prefs.SHOW_APPS, true) }, true)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent != null && intent.action == ACTION_STOP) {
-            stopSelf()
-            return START_NOT_STICKY
+        when (intent?.action) {
+            ACTION_STOP -> {
+                stopSelf()
+                return START_NOT_STICKY
+            }
+            ACTION_TOGGLE_STYLE -> {
+                if (running) toggleStyle()
+                return START_NOT_STICKY
+            }
         }
 
         // Android exige llamar a startForeground cada vez que se arranca el servicio.
@@ -151,6 +117,8 @@ class OverlayService : Service() {
             return START_NOT_STICKY
         }
 
+        ShellClient.acquire(this)
+        shellAcquired = true
         prefs.registerOnSharedPreferenceChangeListener(prefListener)
 
         val t = HandlerThread("monitor-sampler")
@@ -162,6 +130,7 @@ class OverlayService : Service() {
         sampler.startBackground()
 
         running = true
+        notifyState()
         return START_NOT_STICKY
     }
 
@@ -171,20 +140,15 @@ class OverlayService : Service() {
             prefs.unregisterOnSharedPreferenceChangeListener(prefListener)
         } catch (e: Throwable) {
         }
-        sampler.stopBackground()
         worker?.removeCallbacksAndMessages(null)
         thread?.quitSafely()
         thread = null
         worker = null
-
-        try {
-            if (shell != null || binding) {
-                Shizuku.unbindUserService(userServiceArgs, connection, true)
-            }
-        } catch (e: Throwable) {
+        sampler.stopBackground()
+        if (shellAcquired) {
+            ShellClient.release()
+            shellAcquired = false
         }
-        shell = null
-
         val r = root
         if (r != null) {
             try {
@@ -193,26 +157,27 @@ class OverlayService : Service() {
             }
         }
         root = null
+        notifyState()
         super.onDestroy()
     }
 
-    // ---------------------------------------------------------------- Shizuku
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (root == null) return
+        // Al girar la pantalla se usa la posicion guardada para esa orientacion.
+        compact.maxWidthPx = screenSize().x
+        restorePosition()
+        clampParams()
+        updateLayout()
+    }
 
-    private fun ensureShell() {
-        // Si el enlace quedo colgado (Shizuku nunca respondio), se libera para reintentar.
-        if (binding && System.currentTimeMillis() - bindStartedAt > BIND_TIMEOUT_MS) {
-            binding = false
-        }
-        if (shell != null || binding) return
+    private fun notifyState() {
         try {
-            if (!Shizuku.pingBinder()) return
-            if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) return
-            binding = true
-            bindStartedAt = System.currentTimeMillis()
-            Shizuku.bindUserService(userServiceArgs, connection)
+            TileService.requestListeningState(this, ComponentName(this, OverlayTileService::class.java))
         } catch (e: Throwable) {
-            binding = false
         }
+        val l = stateListener
+        if (l != null) ui.post(l)
     }
 
     // ----------------------------------------------------------- Notificacion
@@ -222,10 +187,14 @@ class OverlayService : Service() {
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "Monitor de rendimiento", NotificationManager.IMPORTANCE_LOW)
         )
-
         val stopIntent = PendingIntent.getService(
             this, 0,
             Intent(this, OverlayService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val styleIntent = PendingIntent.getService(
+            this, 2,
+            Intent(this, OverlayService::class.java).setAction(ACTION_TOGGLE_STYLE),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         val openIntent = PendingIntent.getActivity(
@@ -233,19 +202,15 @@ class OverlayService : Service() {
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val stopAction = Notification.Action.Builder(
-            Icon.createWithResource(this, R.drawable.ic_stat), "Detener", stopIntent
-        ).build()
-
         val notification = Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat)
             .setContentTitle("Monitor de rendimiento activo")
-            .setContentText("Toca para abrir los ajustes")
+            .setContentText("Toca la barra para cambiar de vista · mantén para abrir la app")
             .setContentIntent(openIntent)
-            .addAction(stopAction)
+            .addAction(Notification.Action.Builder(Icon.createWithResource(this, R.drawable.ic_panel), "Cambiar vista", styleIntent).build())
+            .addAction(Notification.Action.Builder(Icon.createWithResource(this, R.drawable.ic_stop), "Detener", stopIntent).build())
             .setOngoing(true)
             .build()
-
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
@@ -255,58 +220,13 @@ class OverlayService : Service() {
 
     // ---------------------------------------------------------------- Ventana
 
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
-
-    private fun newText(): TextView {
-        val t = TextView(this)
-        t.typeface = Typeface.MONOSPACE
-        t.setTextColor(Color.WHITE)
-        t.setShadowLayer(2f, 0f, 0f, Color.BLACK)
-        t.includeFontPadding = false
-        return t
-    }
-
     private fun buildOverlay() {
-        val box = LinearLayout(this)
-        box.orientation = LinearLayout.VERTICAL
-        box.setPadding(dp(8), dp(6), dp(8), dp(6))
-
-        tvApp = newText()
-        tvApp.maxWidth = dp(200)
-        tvApp.isSingleLine = true
-        tvApp.ellipsize = TextUtils.TruncateAt.MIDDLE
-        tvApp.setTextColor(GREY)
-
-        tvFps = newText()
-        tvFps.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
-        tvLow = newText()
-        tvPing = newText()
-        tvTop = newText()
-        tvTop.setTextColor(GREY)
-        tvTop.isSingleLine = true
-        tvTop.maxWidth = dp(260)
-        tvTop.ellipsize = TextUtils.TruncateAt.END
-        tvCpu = newText()
-        tvGpu = newText()
-        tvRam = newText()
-        tvBat = newText()
-        tvThermal = newText()
-        graph = GraphView(this)
-
-        box.addView(tvApp)
-        box.addView(tvFps)
-        box.addView(tvLow)
-        box.addView(tvPing)
-        box.addView(tvCpu)
-        box.addView(tvGpu)
-        box.addView(tvRam)
-        box.addView(tvBat)
-        box.addView(tvThermal)
-        box.addView(tvTop)
-        box.addView(
-            graph,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(36))
-        )
+        val box = FrameLayout(this)
+        compact = CompactHudView(this)
+        panel = StellarPanelView(this)
+        compact.maxWidthPx = screenSize().x
+        box.addView(compact, FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT))
+        box.addView(panel, FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT))
 
         params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -318,221 +238,199 @@ class OverlayService : Service() {
             PixelFormat.TRANSLUCENT
         )
         params.gravity = Gravity.TOP or Gravity.START
-        params.x = prefs.getInt(Prefs.POS_X, dp(12))
-        params.y = prefs.getInt(Prefs.POS_Y, dp(60))
+        if (Build.VERSION.SDK_INT >= 28) {
+            params.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+        params.title = "Monitor de rendimiento"
+        restorePosition()
 
-        box.setOnTouchListener(object : View.OnTouchListener {
-            private var startX = 0
-            private var startY = 0
-            private var touchX = 0f
-            private var touchY = 0f
-
-            override fun onTouch(v: View, event: MotionEvent): Boolean {
-                when (event.action) {
-                    MotionEvent.ACTION_DOWN -> {
-                        startX = params.x
-                        startY = params.y
-                        touchX = event.rawX
-                        touchY = event.rawY
-                        return true
-                    }
-                    MotionEvent.ACTION_MOVE -> {
-                        params.x = startX + (event.rawX - touchX).toInt()
-                        params.y = startY + (event.rawY - touchY).toInt()
-                        try {
-                            windowManager.updateViewLayout(box, params)
-                        } catch (e: Throwable) {
-                        }
-                        return true
-                    }
-                    MotionEvent.ACTION_UP -> {
-                        prefs.edit().putInt(Prefs.POS_X, params.x).putInt(Prefs.POS_Y, params.y).apply()
-                        return true
-                    }
-                }
-                return false
+        box.setOnTouchListener(DragListener())
+        box.addOnLayoutChangeListener { _, l, t, r, b, ol, ot, or2, ob ->
+            if (r - l != or2 - ol || b - t != ob - ot) {
+                // Cambio de tamano (otra vista, texto mas grande): que no se salga de la pantalla.
+                if (clampParams()) updateLayout()
             }
-        })
+        }
 
         root = box
+        cfg = HudConfig(prefs)
         applyStyle()
         windowManager.addView(box, params)
-        render(last)
+        render(Snapshot())
+    }
+
+    private inner class DragListener : View.OnTouchListener {
+        private var startX = 0
+        private var startY = 0
+        private var touchX = 0f
+        private var touchY = 0f
+        private var moved = false
+        private var longDone = false
+        private var slop = 12
+        private val longPress = Runnable {
+            if (!moved) {
+                longDone = true
+                openApp()
+            }
+        }
+
+        override fun onTouch(v: View, event: MotionEvent): Boolean {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    slop = ViewConfiguration.get(v.context).scaledTouchSlop
+                    startX = params.x
+                    startY = params.y
+                    touchX = event.rawX
+                    touchY = event.rawY
+                    moved = false
+                    longDone = false
+                    ui.postDelayed(longPress, LONG_PRESS_MS)
+                    return true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = event.rawX - touchX
+                    val dy = event.rawY - touchY
+                    if (!moved && (abs(dx) > slop || abs(dy) > slop)) {
+                        moved = true
+                        ui.removeCallbacks(longPress)
+                    }
+                    if (moved) {
+                        params.x = startX + dx.toInt()
+                        params.y = startY + dy.toInt()
+                        clampParams()
+                        updateLayout()
+                    }
+                    return true
+                }
+                MotionEvent.ACTION_UP -> {
+                    ui.removeCallbacks(longPress)
+                    if (moved) savePosition() else if (!longDone) toggleStyle()
+                    return true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    ui.removeCallbacks(longPress)
+                    if (moved) savePosition()
+                    return true
+                }
+            }
+            return false
+        }
+    }
+
+    private fun openApp() {
+        try {
+            startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (e: Throwable) {
+        }
+    }
+
+    private fun style(): Int = prefs.getInt(Prefs.STYLE, Prefs.STYLE_COMPACT)
+
+    private fun toggleStyle() {
+        val next = if (style() == Prefs.STYLE_PANEL) Prefs.STYLE_COMPACT else Prefs.STYLE_PANEL
+        prefs.edit().putInt(Prefs.STYLE, next).apply()
+        // El listener de preferencias aplica el cambio.
     }
 
     private fun applyStyle() {
-        val size = prefs.getInt(Prefs.TEXT_SIZE, 12).toFloat()
-        val lines = listOf(tvLow, tvPing, tvCpu, tvGpu, tvRam, tvBat, tvThermal, tvTop)
-        for (t in lines) t.setTextSize(TypedValue.COMPLEX_UNIT_SP, size)
-        tvFps.setTextSize(TypedValue.COMPLEX_UNIT_SP, size + 4f)
-        tvApp.setTextSize(TypedValue.COMPLEX_UNIT_SP, size - 2f)
-
-        val alpha = (prefs.getInt(Prefs.OPACITY, 70) * 255 / 100).coerceIn(0, 255)
-        val bg = GradientDrawable()
-        bg.setColor(Color.argb(alpha, 0, 0, 0))
-        bg.cornerRadius = dp(10).toFloat()
-        root?.background = bg
-    }
-
-    // ------------------------------------------------------------------ Texto
-
-    private fun fmt(v: Float, decimals: Int): String =
-        String.format(Locale.US, if (decimals == 0) "%.0f" else "%.1f", v)
-
-    /** "com.ejemplo.juego" -> "juego": cabe mejor en la barra. */
-    private fun shortName(pkg: String): String = pkg.substringAfterLast('.')
-
-    private fun colorForFps(fps: Float): Int = when {
-        fps >= 50f -> GREEN
-        fps >= 30f -> YELLOW
-        else -> RED
-    }
-
-    private fun render(s: Snapshot) {
-        last = s
         if (root == null) return
+        val p = style() == Prefs.STYLE_PANEL
+        panel.visibility = if (p) View.VISIBLE else View.GONE
+        compact.visibility = if (p) View.GONE else View.VISIBLE
+    }
 
-        val showFps = prefs.getBoolean(Prefs.SHOW_FPS, true)
-        val showCpu = prefs.getBoolean(Prefs.SHOW_CPU, true)
-        val showGpu = prefs.getBoolean(Prefs.SHOW_GPU, true)
-        val showRam = prefs.getBoolean(Prefs.SHOW_RAM, true)
-        val showBat = prefs.getBoolean(Prefs.SHOW_BAT, true)
-        val showTemp = prefs.getBoolean(Prefs.SHOW_TEMP, true)
-        val showGraph = prefs.getBoolean(Prefs.SHOW_GRAPH, true)
+    private fun onPrefsChanged(key: String?) {
+        if (root == null) return
+        cfg = HudConfig(prefs)
+        if (key == Prefs.STYLE) applyStyle()
+        render(state.snap, false)
+    }
 
-        // App al frente
-        val pkgText = if (s.shellOk) (s.pkg ?: "") else ""
-        tvApp.text = pkgText
-        tvApp.visibility = if (showFps && pkgText.isNotEmpty()) View.VISIBLE else View.GONE
+    private fun isLandscape(): Boolean =
+        resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
 
-        // FPS
-        tvFps.visibility = if (showFps) View.VISIBLE else View.GONE
-        if (!s.shellOk) {
-            tvFps.setTextColor(GREY)
-            tvFps.text = "FPS —  (necesita Shizuku)"
-        } else if (s.fps.isNaN()) {
-            tvFps.setTextColor(GREY)
-            // Antes solo salia "FPS —". Ahora se dice la causa (sin app detectada, sin capa, etc.).
-            tvFps.text = "FPS —" + (if (s.fpsStatus.isNotEmpty()) "  " + s.fpsStatus else "")
-        } else {
-            tvFps.setTextColor(colorForFps(s.fps))
-            val ms = if (s.frameMs.isNaN()) "" else "  " + fmt(s.frameMs, 1) + " ms"
-            tvFps.text = "FPS " + fmt(s.fps, 0) + ms
-        }
+    private fun restorePosition() {
+        val land = isLandscape()
+        params.x = prefs.getInt(if (land) Prefs.POS_X_LAND else Prefs.POS_X, Hud.dpi(this, 12))
+        params.y = prefs.getInt(if (land) Prefs.POS_Y_LAND else Prefs.POS_Y, Hud.dpi(this, if (land) 8 else 60))
+    }
 
-        val lowParts = ArrayList<String>()
-        if (!s.low1.isNaN()) lowParts.add("1% low " + fmt(s.low1, 0))
-        if (!s.refreshHz.isNaN()) lowParts.add(fmt(s.refreshHz, 0) + " Hz")
-        tvLow.text = lowParts.joinToString(" · ")
-        tvLow.visibility = if (showFps && lowParts.isNotEmpty()) View.VISIBLE else View.GONE
+    private fun savePosition() {
+        val land = isLandscape()
+        prefs.edit()
+            .putInt(if (land) Prefs.POS_X_LAND else Prefs.POS_X, params.x)
+            .putInt(if (land) Prefs.POS_Y_LAND else Prefs.POS_Y, params.y)
+            .apply()
+    }
 
-        // Ping: independiente de los FPS, funciona con cualquier juego que tenga conexion de red.
-        val showPing = prefs.getBoolean(Prefs.SHOW_PING, true)
-        val pingSuffix = if (s.pingKind == PingEngine.KIND_INTERNET) " (internet)" else ""
-        tvPing.text = when {
-            !s.shellOk -> "Ping —  (necesita Shizuku)"
-            s.pingIp == null -> "Ping —  buscando juego"
-            s.pingMs.isNaN() -> "Ping —  sin respuesta" + pingSuffix
-            else -> "Ping " + fmt(s.pingMs, 0) + " ms · prom " + fmt(s.pingAvgMs, 0) + pingSuffix
-        }
-        tvPing.setTextColor(
-            when {
-                s.pingMs.isNaN() -> GREY
-                s.pingMs < 60f -> GREEN
-                s.pingMs < 120f -> YELLOW
-                else -> RED
+    private fun screenSize(): Point {
+        return try {
+            if (Build.VERSION.SDK_INT >= 30) {
+                val b = windowManager.currentWindowMetrics.bounds
+                Point(b.width(), b.height())
+            } else {
+                val dm = DisplayMetrics()
+                @Suppress("DEPRECATION")
+                windowManager.defaultDisplay.getRealMetrics(dm)
+                Point(dm.widthPixels, dm.heightPixels)
             }
-        )
-        tvPing.visibility = if (showPing) View.VISIBLE else View.GONE
-
-        // Categoria de consumo: que app usa mas CPU y mas RAM (sin contar la propia barra).
-        val showApps = prefs.getBoolean(Prefs.SHOW_APPS, true)
-        val others = s.apps.filter { it.pkg != packageName }
-        val topCpu = others.firstOrNull { !it.cpuPct.isNaN() && it.cpuPct >= 1f }
-        val topRam = others.maxByOrNull { it.ramMb }
-        val topParts = ArrayList<String>()
-        if (topCpu != null) topParts.add("CPU " + shortName(topCpu.pkg) + " " + fmt(topCpu.cpuPct, 0) + "%")
-        if (topRam != null && topRam.ramMb > 0f) topParts.add("RAM " + shortName(topRam.pkg) + " " + fmt(topRam.ramMb, 0) + " MB")
-        tvTop.text = topParts.joinToString(" · ")
-        tvTop.visibility = if (showApps && topParts.isNotEmpty()) View.VISIBLE else View.GONE
-
-        // Grafica
-        if (!s.fps.isNaN() && s.shellOk) {
-            val maxHz = if (s.refreshHz.isNaN()) 60f else maxOf(60f, s.refreshHz)
-            graph.push(s.fps, maxHz)
+        } catch (e: Throwable) {
+            val dm = resources.displayMetrics
+            Point(dm.widthPixels, dm.heightPixels)
         }
-        graph.visibility = if (showFps && showGraph && s.shellOk) View.VISIBLE else View.GONE
+    }
 
-        // CPU
-        val cpu = ArrayList<String>()
-        if (!s.cpuPct.isNaN()) cpu.add(fmt(s.cpuPct, 0) + "%")
-        if (s.cpuMhz > 0) cpu.add(s.cpuMhz.toString() + " MHz")
-        if (showTemp && !s.cpuTemp.isNaN()) cpu.add(fmt(s.cpuTemp, 0) + "°")
-        tvCpu.text = "CPU " + (if (cpu.isEmpty()) "—" else cpu.joinToString(" · "))
-        tvCpu.visibility = if (showCpu) View.VISIBLE else View.GONE
+    /** Mantiene la barra dentro de la pantalla. Devuelve true si cambio la posicion. */
+    private fun clampParams(): Boolean {
+        val r = root ?: return false
+        val sz = screenSize()
+        val w = if (r.width > 0) r.width else r.measuredWidth
+        val h = if (r.height > 0) r.height else r.measuredHeight
+        val nx = params.x.coerceIn(0, maxOf(0, sz.x - w))
+        val ny = params.y.coerceIn(0, maxOf(0, sz.y - h))
+        val changed = nx != params.x || ny != params.y
+        params.x = nx
+        params.y = ny
+        return changed
+    }
 
-        // GPU
-        val gpu = ArrayList<String>()
-        if (!s.gpuPct.isNaN()) gpu.add(fmt(s.gpuPct, 0) + "%")
-        if (s.gpuMhz > 0) gpu.add(s.gpuMhz.toString() + " MHz")
-        if (showTemp && !s.gpuTemp.isNaN()) gpu.add(fmt(s.gpuTemp, 0) + "°")
-        tvGpu.text = "GPU " + (if (gpu.isEmpty()) "—" else gpu.joinToString(" · "))
-        tvGpu.visibility = if (showGpu) View.VISIBLE else View.GONE
-
-        // RAM
-        if (s.ramTotalMb > 0L) {
-            val pct = s.ramUsedMb * 100f / s.ramTotalMb
-            tvRam.text = "RAM " + fmt(s.ramUsedMb / 1024f, 1) + "/" + fmt(s.ramTotalMb / 1024f, 1) +
-                " GB · " + fmt(pct, 0) + "%"
-        } else {
-            tvRam.text = "RAM —"
+    private fun updateLayout() {
+        val r = root ?: return
+        try {
+            windowManager.updateViewLayout(r, params)
+        } catch (e: Throwable) {
         }
-        tvRam.visibility = if (showRam) View.VISIBLE else View.GONE
+    }
 
-        // Bateria
-        val bat = ArrayList<String>()
-        if (s.batPct >= 0) bat.add((if (s.charging) "⚡" else "") + s.batPct + "%")
-        if (showTemp && !s.batTemp.isNaN()) bat.add(fmt(s.batTemp, 1) + "°")
-        if (s.batMa != Int.MIN_VALUE) bat.add(s.batMa.toString() + " mA")
-        if (!s.batW.isNaN()) bat.add(fmt(s.batW, 1) + " W")
-        tvBat.text = "BAT " + (if (bat.isEmpty()) "—" else bat.joinToString(" · "))
-        tvBat.visibility = if (showBat) View.VISIBLE else View.GONE
+    // ------------------------------------------------------------------ Dibujar
 
-        // Estado termico del sistema
-        if (s.thermalStatus >= 0) {
-            val idx = if (s.thermalStatus < THERMAL_NAMES.size) s.thermalStatus else THERMAL_NAMES.size - 1
-            tvThermal.text = "Térmico: " + THERMAL_NAMES[idx]
-            tvThermal.setTextColor(
-                when {
-                    s.thermalStatus <= 0 -> GREEN
-                    s.thermalStatus == 1 -> YELLOW
-                    else -> RED
-                }
-            )
-            tvThermal.visibility = if (showTemp) View.VISIBLE else View.GONE
-        } else {
-            tvThermal.visibility = View.GONE
+    private fun render(s: Snapshot, push: Boolean = true) {
+        if (root == null) return
+        if (push) {
+            if (s.pkg != lastPkg) {
+                // Otro juego: la grafica de FPS empieza de cero.
+                lastPkg = s.pkg
+                state.clearFps()
+            }
+            state.push(s)
         }
+        val c = cfg ?: HudConfig(prefs).also { cfg = it }
+        if (style() == Prefs.STYLE_PANEL) panel.update(state, c) else compact.update(state, c)
     }
 
     companion object {
         const val ACTION_STOP = "com.rendimiento.monitor.action.STOP"
+        const val ACTION_TOGGLE_STYLE = "com.rendimiento.monitor.action.TOGGLE_STYLE"
 
         private const val CHANNEL_ID = "monitor_rendimiento"
         private const val NOTIF_ID = 1001
-        private const val SAMPLE_EVERY_MS = 1000L
-        private const val BIND_TIMEOUT_MS = 10000L
-
-        private val GREEN = Color.parseColor("#66BB6A")
-        private val YELLOW = Color.parseColor("#FFCA28")
-        private val RED = Color.parseColor("#EF5350")
-        private val GREY = Color.parseColor("#B0BEC5")
-
-        private val THERMAL_NAMES = arrayOf(
-            "Normal", "Leve", "Moderado", "Severo", "Crítico", "Emergencia", "Apagado"
-        )
+        private const val LONG_PRESS_MS = 650L
 
         @Volatile
         var running: Boolean = false
+
+        /** La pantalla principal se entera cuando la barra se enciende o se apaga. */
+        @Volatile
+        var stateListener: Runnable? = null
     }
 }

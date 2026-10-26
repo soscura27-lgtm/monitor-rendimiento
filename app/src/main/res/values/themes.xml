@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Monitor" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/space_bg</item>
+        <item name="android:colorBackground">@color/space_bg</item>
+        <item name="android:colorPrimary">#0B1238</item>
+        <item name="android:colorPrimaryDark">@color/space_bg</item>
+        <item name="android:colorAccent">@color/neon_cyan</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@color/space_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+
+    <!-- Actividad invisible que usa el mosaico de ajustes rapidos para iniciar la barra. -->
+    <style name="Theme.Monitor.Invisible" parent="@android:style/Theme.Translucent.NoTitleBar">
+        <item name="android:windowNoDisplay">false</item>
+        <item name="android:windowAnimationStyle">@null</item>
+        <item name="android:windowDisablePreview">true</item>
+    </style>
+</resources>

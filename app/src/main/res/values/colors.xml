@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="ic_launcher_background">#0D1B2A</color>
+    <color name="space_bg">#050A24</color>
+    <color name="neon_cyan">#2EE6FF</color>
+    <color name="neon_purple">#9D5CFF</color>
 </resources>
