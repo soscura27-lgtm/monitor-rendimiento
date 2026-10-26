@@ -126,22 +126,48 @@ class ShellService() : IShellService.Stub() {
         for (line in lines.drop(1)) {
             val f = line.trim().split(WS)
             if (f.size < 8) continue
-            val remote = f[2]
-            val state = f[3]
             val uid = f[7].toIntOrNull() ?: continue
             if (uid < APP_UID_MIN) continue
-            val parts = remote.split(':')
-            if (parts.size != 2) continue
-            val ipHex = parts[0]
-            val port = parts[1].toIntOrNull(16) ?: continue
+            val localPort = parsePort(f[1]) ?: continue
+            val state = f[3]
+            val remoteParts = f[2].split(':')
+            if (remoteParts.size != 2) continue
+            val ipHex = remoteParts[0]
+            val remotePort = remoteParts[1].toIntOrNull(16) ?: continue
             if (ipHex.length != 8) continue
-            // /proc/net/tcp guarda la IPv4 en orden little-endian.
+            // /proc/net/tcp y udp guardan la IPv4 en orden little-endian.
             val b = (0 until 4).map { ipHex.substring(it * 2, it * 2 + 2).toInt(16) }
             val ip = "${b[3]}.${b[2]}.${b[1]}.${b[0]}"
-            if (ip == "0.0.0.0" || port == 0) continue
+            // Los UDP sin conexion (0.0.0.0:0) se incluyen igual: su puerto local sirve para cruzar con conntrack.
             sb.append(uid).append('|').append(proto).append('|').append(state).append('|')
-                .append(ip).append('|').append(port).append('\n')
+                .append(ip).append('|').append(remotePort).append('|').append(localPort).append('\n')
         }
+    }
+
+    private fun parsePort(addr: String): Int? = addr.substringAfter(':', "").toIntOrNull(16)
+
+    override fun conntrack(): String {
+        val lines = try {
+            File("/proc/net/nf_conntrack").readLines()
+        } catch (e: Throwable) {
+            return ""
+        }
+        val sb = StringBuilder()
+        for (line in lines) {
+            val f = line.trim().split(WS)
+            if (f.size < 4) continue
+            val proto = f[2]
+            if (proto != "tcp" && proto != "udp") continue
+            // La primera aparicion de cada clave es la direccion original (la que sale del telefono).
+            val sport = f.firstOrNull { it.startsWith("sport=") }?.substringAfter('=') ?: continue
+            val dst = f.firstOrNull { it.startsWith("dst=") }?.substringAfter('=') ?: continue
+            if (dst.contains(':')) continue
+            sb.append(proto).append('|').append(sport).append('|').append(dst).append('|')
+                .append(f.firstOrNull { it.startsWith("dport=") }?.substringAfter('=') ?: "0")
+                .append('\n')
+            if (sb.length >= MAX_OUT) break
+        }
+        return sb.toString()
     }
 
     private fun readLongOrNeg(path: String): Long =

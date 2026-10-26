@@ -30,9 +30,10 @@ class Sampler(
     private val fpsEngine = FpsEngine(ctx.packageName, shellProvider)
     private val appMonitor = AppMonitor(shellProvider)
 
+    /** UID del ultimo juego (cualquier app que no sea la barra) que estuvo al frente. */
     @Volatile
-    private var fgUid: Int? = null
-    private val pingEngine = PingEngine(shellProvider) { fgUid }
+    private var gameUid: Int? = null
+    private val pingEngine = PingEngine(shellProvider) { gameUid }
 
     private var prevIdle = -1L
     private var prevTotal = -1L
@@ -45,7 +46,7 @@ class Sampler(
     /** Detiene el hilo de ping al cerrar la barra. */
     fun stopBackground() {
         pingEngine.stop()
-        fgUid = null
+        gameUid = null
     }
 
     private var zonesViaShell: Boolean? = null
@@ -174,8 +175,12 @@ class Sampler(
 
         val f = fpsEngine.poll()
 
-        // Ping y consumo por app: el UID del juego al frente sale del mapa de paquetes.
-        fgUid = f.pkg?.let { appMonitor.uidOf(it) }
+        // Ping y consumo por app. El ping sigue al ultimo juego: si la barra o el menu quedan
+        // al frente, se mantiene la medicion del juego y no se pierde el dato.
+        val fgPkg = f.pkg
+        if (fgPkg != null && fgPkg != ctx.packageName) {
+            appMonitor.uidOf(fgPkg)?.let { gameUid = it }
+        }
         appMonitor.update(totalDelta, System.currentTimeMillis())
         val ping = pingEngine.current()
 
@@ -184,6 +189,7 @@ class Sampler(
             pingMs = ping.lastMs,
             pingAvgMs = ping.avgMs,
             pingIp = ping.ip,
+            pingKind = ping.kind,
             apps = appMonitor.current(),
             shellOk = shellOk,
             pkg = f.pkg,

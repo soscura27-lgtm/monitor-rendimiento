@@ -30,5 +30,7 @@ data class Snapshot(
     val pingMs: Float = Float.NaN,
     val pingAvgMs: Float = Float.NaN,
     val pingIp: String? = null,
+    /** PingEngine.KIND_SERVER (servidor del juego), KIND_INTERNET (1.1.1.1) o KIND_NONE. */
+    val pingKind: Int = PingEngine.KIND_NONE,
     val apps: List<AppMonitor.AppStat> = emptyList()
 )

@@ -3,12 +3,16 @@ package com.rendimiento.monitor
 import kotlin.math.roundToInt
 
 /**
- * Mide el ping al servidor de la app que esta al frente, sin importar el juego.
+ * Mide el ping del juego que esta (o estuvo) al frente, para cualquier juego.
  *
- * Como no hay API publica para saber a donde conecta otra app, se usa /proc/net (tcp y udp),
- * que trae el UID dueño de cada socket. Se elige la IP remota publica que mas sockets tiene
- * ese UID y se le manda un ping ICMP desde el shell. Corre en su propio hilo para que un ping
- * lento (hasta 1 s de espera) no retrase FPS ni CPU.
+ * Busca el servidor en tres pasos, del mas exacto al mas general:
+ * 1. IP remota publica de los sockets del UID del juego (TCP y UDP conectado).
+ * 2. Juegos con UDP sin conexion: sus puertos locales se cruzan con la tabla de conexiones
+ *    del kernel (nf_conntrack), que si conoce a donde se envio cada paquete.
+ * 3. Si nada de lo anterior aparece, ping a internet (1.1.1.1). Se marca como "internet"
+ *    porque no es el servidor del juego, pero siempre da una cifra mientras el juego tenga red.
+ *
+ * Corre en su propio hilo para que un ping lento (hasta 1 s de espera) no retrase FPS ni CPU.
  */
 class PingEngine(
     private val shellProvider: () -> IShellService?,
@@ -17,6 +21,7 @@ class PingEngine(
 
     class Result(
         val ip: String?,
+        val kind: Int,
         val lastMs: Float,
         val avgMs: Float
     )
@@ -27,6 +32,9 @@ class PingEngine(
 
     @Volatile
     private var targetIp: String? = null
+
+    @Volatile
+    private var targetKind = KIND_NONE
 
     @Volatile
     private var lastMs = Float.NaN
@@ -53,6 +61,7 @@ class PingEngine(
         thread?.interrupt()
         thread = null
         targetIp = null
+        targetKind = KIND_NONE
         lastMs = Float.NaN
         avgMs = Float.NaN
         count = 0
@@ -60,7 +69,7 @@ class PingEngine(
     }
 
     /** Lectura actual; nunca bloquea. */
-    fun current(): Result = Result(targetIp, lastMs, avgMs)
+    fun current(): Result = Result(targetIp, targetKind, lastMs, avgMs)
 
     private fun loop() {
         var lastTargetCheck = 0L
@@ -69,9 +78,11 @@ class PingEngine(
                 val now = System.currentTimeMillis()
                 if (now - lastTargetCheck >= TARGET_EVERY_MS || targetIp == null) {
                     lastTargetCheck = now
-                    val ip = findServerIp()
+                    val t = findTarget()
+                    val ip = t?.first
                     if (ip != targetIp) {
                         targetIp = ip
+                        targetKind = t?.second ?: KIND_NONE
                         count = 0
                         pos = 0
                         lastMs = Float.NaN
@@ -82,7 +93,7 @@ class PingEngine(
                 if (ip != null) {
                     val ms = pingOnce(ip)
                     if (!ms.isNaN()) push(ms)
-                    lastMs = if (ms.isNaN()) Float.NaN else ms
+                    lastMs = ms
                     avgMs = average()
                 }
                 Thread.sleep(PING_EVERY_MS)
@@ -98,26 +109,51 @@ class PingEngine(
         }
     }
 
-    private fun findServerIp(): String? {
+    /** Devuelve (IP, tipo) del destino a medir, o null si no hay juego conocido. */
+    private fun findTarget(): Pair<String, Int>? {
         val uid = uidProvider() ?: return null
         val sh = shellProvider() ?: return null
+
         val raw = try {
             sh.sockets()
         } catch (e: Throwable) {
-            return null
+            ""
         }
-        val counts = HashMap<String, Int>()
+        val remoteCounts = HashMap<String, Int>()
+        val localPorts = HashSet<Int>()
         for (line in raw.lineSequence()) {
             val f = line.split('|')
-            if (f.size != 5) continue
+            if (f.size != 6) continue
             if (f[0].toIntOrNull() != uid) continue
+            f[5].toIntOrNull()?.let { localPorts.add(it) }
             val ip = f[3]
             if (!isPublicIpv4(ip)) continue
-            // UDP sin conexion aparece con remota 0.0.0.0 y ya se filtro arriba; TCP en ESTABLISHED (01) pesa mas.
+            // TCP en ESTABLISHED (01) pesa mas que un UDP suelto.
             val weight = if (f[1] == "tcp" && f[2] == "01") 2 else 1
-            counts[ip] = (counts[ip] ?: 0) + weight
+            remoteCounts[ip] = (remoteCounts[ip] ?: 0) + weight
         }
-        return counts.maxByOrNull { it.value }?.key
+        remoteCounts.maxByOrNull { it.value }?.let { return Pair(it.key, KIND_SERVER) }
+
+        if (localPorts.isNotEmpty()) {
+            val ct = try {
+                sh.conntrack()
+            } catch (e: Throwable) {
+                ""
+            }
+            val counts = HashMap<String, Int>()
+            for (line in ct.lineSequence()) {
+                val f = line.split('|')
+                if (f.size != 4) continue
+                val sport = f[1].toIntOrNull() ?: continue
+                if (sport !in localPorts) continue
+                val ip = f[2]
+                if (!isPublicIpv4(ip)) continue
+                counts[ip] = (counts[ip] ?: 0) + 1
+            }
+            counts.maxByOrNull { it.value }?.let { return Pair(it.key, KIND_SERVER) }
+        }
+
+        return Pair(FALLBACK_IP, KIND_INTERNET)
     }
 
     private fun pingOnce(ip: String): Float {
@@ -145,6 +181,11 @@ class PingEngine(
     }
 
     companion object {
+        const val KIND_NONE = 0
+        const val KIND_SERVER = 1
+        const val KIND_INTERNET = 2
+
+        private const val FALLBACK_IP = "1.1.1.1"
         private const val WINDOW = 10
         private const val PING_EVERY_MS = 1000L
         private const val TARGET_EVERY_MS = 5000L

@@ -16,6 +16,10 @@ interface IShellService {
     // Tabla de procesos: una linea por proceso con "pid|uid|utime|stime|rssKb|bytesRx|bytesTx|cmdline".
     String procTable() = 4;
 
-    // Conexiones TCP/UDP de todos los UIDs: una linea por socket con "uid|proto|state|remoteIp|remotePort".
+    // Conexiones TCP/UDP de los UIDs de apps: una linea por socket con "uid|proto|state|remoteIp|remotePort|localPort".
+    // Los UDP sin conexion salen con remota 0.0.0.0 y puerto 0.
     String sockets() = 5;
+
+    // Tabla de conexiones del kernel (nf_conntrack): una linea "proto|srcPort|dstIp|dstPort" por flujo IPv4.
+    String conntrack() = 6;
 }

@@ -51,7 +51,7 @@ class ConsumoActivity : Activity() {
             .daemon(false)
             .processNameSuffix("shell-ui")
             .debuggable(false)
-            .version(2)
+            .version(3)
     }
 
     private val connection = object : ServiceConnection {

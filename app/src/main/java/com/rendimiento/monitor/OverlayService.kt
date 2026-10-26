@@ -122,8 +122,8 @@ class OverlayService : Service() {
             .daemon(false)
             .processNameSuffix("shell")
             .debuggable(false)
-            // Version 2: la interfaz AIDL cambio (procTable y sockets). Subirla obliga a Shizuku a reiniciar el proceso.
-            .version(2)
+            // Version 3: la interfaz AIDL cambio (sockets con puerto local y conntrack). Subirla obliga a Shizuku a reiniciar el proceso.
+            .version(3)
         sampler = Sampler(this) { shell }
     }
 
@@ -428,11 +428,12 @@ class OverlayService : Service() {
 
         // Ping: independiente de los FPS, funciona con cualquier juego que tenga conexion de red.
         val showPing = prefs.getBoolean(Prefs.SHOW_PING, true)
+        val pingSuffix = if (s.pingKind == PingEngine.KIND_INTERNET) " (internet)" else ""
         tvPing.text = when {
             !s.shellOk -> "Ping —  (necesita Shizuku)"
-            s.pingIp == null -> "Ping —  buscando servidor"
-            s.pingMs.isNaN() -> "Ping —  sin respuesta"
-            else -> "Ping " + fmt(s.pingMs, 0) + " ms · prom " + fmt(s.pingAvgMs, 0)
+            s.pingIp == null -> "Ping —  buscando juego"
+            s.pingMs.isNaN() -> "Ping —  sin respuesta" + pingSuffix
+            else -> "Ping " + fmt(s.pingMs, 0) + " ms · prom " + fmt(s.pingAvgMs, 0) + pingSuffix
         }
         tvPing.setTextColor(
             when {
