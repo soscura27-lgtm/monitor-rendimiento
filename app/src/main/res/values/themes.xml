@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Tema del sistema (solo afecta al arranque; el resto lo pinta Compose). Versión clara. -->
+    <style name="Theme.BajaYa" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>

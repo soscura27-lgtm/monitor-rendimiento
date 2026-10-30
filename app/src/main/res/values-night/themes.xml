@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Versión oscura del tema de arranque, para evitar un destello blanco. -->
+    <style name="Theme.BajaYa" parent="android:Theme.Material.NoActionBar" />
+</resources>
